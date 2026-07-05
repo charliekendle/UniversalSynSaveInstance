@@ -139,7 +139,10 @@ end
 
 local CLIENT_VERSION = tonumber(string.match(FULL_VERSION, "%d+%.(%d+)")) or 9e9
 local __BREAK = "__BREAK" .. service.HttpService:GenerateGUID(false)
-
+local BinarySerializer = loadstring(
+    game:HttpGet("https://raw.githubusercontent.com/charliekendle/UniversalSynSaveInstance/main/BinarySerializer.luau", true),
+    "BinarySerializer"
+)()
 local CFrame_Rotation_IDs = {
     ["\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63"] = 0x02,
     ["\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\63\0\0\0\0"] = 0x03,
@@ -2523,7 +2526,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         -- * New:
         __DEBUG_MODE = false,
 
-        -- Binary = false, -- true in syn newer versions (false in our case because no binary support yet), Description: Saves everything in Binary Mode (rbxl/rbxm).
+        Binary = false, -- true in syn newer versions (false in our case because no binary support yet), Description: Saves everything in Binary Mode (rbxl/rbxm).
         Callback = false,
         --Clipboard/CopyToClipboard = false, -- Description: If set to true, the serialized data will be set to the clipboard, which can be later pasted into studio easily. Useful for saving models. (Binary Only)
         -- MaxThreads = 3 -- Description: The number of decompilation threads that can run at once. More threads means it can decompile for scripts at a time.
@@ -2955,7 +2958,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
             end
         end
 
-        local filetype = IsModel and ".rbxmx" or ".rbxlx"
+        local filetype = OPTIONS.Binary
+    and (IsModel and ".rbxm" or ".rbxl")
+    or (IsModel and ".rbxmx" or ".rbxlx")
 
         if FilePath then
             placename = FilePath
@@ -4116,62 +4121,96 @@ end
             "</roblox><!-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw -->"
         savebuffer_size += 1
         save_cache()
-        do
-            local function buildFinalString(chunks)
-                local parts = table.create(#chunks + 1)
-                parts[1] = header
+            do
+    local Callback = OPTIONS.Callback
 
-                table.move(chunks, 1, #chunks, 2, parts)
-
-                return table.concat(parts)
+    if OPTIONS.Binary then
+        -- Binary output: delegate entirely to BinarySerializer
+        local binary_output = BinarySerializer.serialize(
+            ToSaveList,
+            IsModel,
+            ClassList,
+            GetInheritedProps,
+            function(instance, property)
+                return ReadProperty(instance, property, property.Name, property.Special, property.Category, property.Optional)
             end
+        )
 
-            local Callback = OPTIONS.Callback
-            if Callback then
-                Callback(buildFinalString(chunks), chunks)
-            elseif OPTIONS.AlternativeWritefile and appendfile then
-                local SEGMENT_SIZE = 4145728 -- Celery has an arbitrary savefile/appendfile size limit of ~4MB for reasons unknown. This is a workaround to save the file in segments.
-                local totallen = 0
-                for _, chunk in chunks do
-                    totallen += math.ceil(#chunk / SEGMENT_SIZE)
-                end
-
-                local currentlen = 0
-
-                for _, chunk in chunks do
-                    local chunk_len = #chunk
-                    local offset = 1
-
-                    while offset <= chunk_len do
-                        local savestr = string.sub(chunk, offset, offset + SEGMENT_SIZE - 1)
-
-                        run_with_loading(
-                            "Writing to File " .. math.round(currentlen / totallen * 100) .. "% (Depends on Exec)",
-                            nil,
-                            true,
-                            appendfile,
-                            placename,
-                            savestr
-                        )
-
-                        currentlen += 1
-                        offset += SEGMENT_SIZE
-
-                        if offset <= chunk_len then
-                            task.wait()
-                        end
-                    end
-                end
-            else
+        if Callback then
+            Callback(binary_output, {binary_output})
+        elseif OPTIONS.AlternativeWritefile and appendfile then
+            local SEGMENT_SIZE = 4145728
+            local offset = 1
+            local total_len = #binary_output
+            while offset <= total_len do
+                local seg = string.sub(binary_output, offset, offset + SEGMENT_SIZE - 1)
                 run_with_loading(
-                    "Writing " .. get_size_format() .. " to File (Depends on Exec)",
+                    "Writing to File (Binary)",
                     nil,
                     true,
-                    writefile,
+                    appendfile,
                     placename,
-                    buildFinalString(chunks)
+                    seg
                 )
+                offset += SEGMENT_SIZE
+                if offset <= total_len then task.wait() end
             end
+        else
+            run_with_loading(
+                "Writing " .. get_size_format() .. " to File (Binary)",
+                nil,
+                true,
+                writefile,
+                placename,
+                binary_output
+            )
+        end
+    else
+        -- Existing XML output path (unchanged)
+        local function buildFinalString(chunks)
+            local parts = table.create(#chunks + 1)
+            parts[1] = header
+            table.move(chunks, 1, #chunks, 2, parts)
+            return table.concat(parts)
+        end
+
+        if Callback then
+            Callback(buildFinalString(chunks), chunks)
+        elseif OPTIONS.AlternativeWritefile and appendfile then
+            local SEGMENT_SIZE = 4145728
+            local totallen = 0
+            for _, chunk in chunks do
+                totallen += math.ceil(#chunk / SEGMENT_SIZE)
+            end
+            local currentlen = 0
+            for _, chunk in chunks do
+                local chunk_len = #chunk
+                local offset = 1
+                while offset <= chunk_len do
+                    local savestr = string.sub(chunk, offset, offset + SEGMENT_SIZE - 1)
+                    run_with_loading(
+                        "Writing to File " .. math.round(currentlen / totallen * 100) .. "% (Depends on Exec)",
+                        nil,
+                        true,
+                        appendfile,
+                        placename,
+                        savestr
+                    )
+                    currentlen += 1
+                    offset += SEGMENT_SIZE
+                    if offset <= chunk_len then task.wait() end
+                end
+            end
+        else
+            run_with_loading(
+                "Writing " .. get_size_format() .. " to File (Depends on Exec)",
+                nil,
+                true,
+                writefile,
+                placename,
+                buildFinalString(chunks)
+            )
+        end
         end
     end
 
