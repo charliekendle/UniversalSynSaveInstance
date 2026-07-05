@@ -3509,15 +3509,17 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
             local Callback = OPTIONS.Callback
 
             if OPTIONS.Binary then
-                local binary_output = BinarySerializer.serialize(
-                    ToSaveList,
-                    IsModel,
-                    ClassList,
-                    GetInheritedProps,
-                    function(instance, property)
-                        return ReadProperty(instance, property, property.Name, property.Special, property.Category, property.Optional)
-                    end
-                )
+          local binary_output = BinarySerializer.serialize(
+    ToSaveList,
+    IsModel,
+    ClassList,
+    GetInheritedProps,
+    function(instance, property)
+        local v = ReadProperty(instance, property, property.Name, property.Special, property.Category, property.Optional)
+        if v == __BREAK then return nil end
+        return v
+    end
+)
 
                 if Callback then
                     Callback(binary_output, { binary_output })
