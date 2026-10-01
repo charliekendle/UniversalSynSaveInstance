@@ -20,10 +20,11 @@ synsaveinstance(Options)
 
 Keep `TreatUnionsAsParts = false` (the default) to write `UnionOperation` instances
 as unions. Setting it to `true` deliberately replaces their geometry with a Part.
-This fork also tries the executor's `gethiddenproperty` for a union's published
-`AssetId` when writing its `Content`, before trying the optional
-`UGCValidationService` fallback. If neither the asset ID nor the union's raw CSG
-data is available to the client, a client-side save cannot reproduce its shape.
+The serializer tries both available protected-property readers for nonempty
+`ChildData`, `MeshData`, and `PhysicsData` (including the `*Data2` fields).
+These are the union's serialized CSG payload. A client-side save can preserve
+the shape only when the client exposes that payload or an accessible asset
+reference; empty fields cannot be reconstructed from the part's size and color.
 
 # Universal Syn Save Instance
 

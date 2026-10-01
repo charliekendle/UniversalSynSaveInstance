@@ -2249,27 +2249,6 @@ do
 			end,
 		},
 		PartOperation = {
-			Content = function(instance)
-				-- Published CSG has an AssetId. The UGC fallback is normally disabled,
-				-- so try the executor's hidden-property reader first.
-				local assetId
-				if gethiddenproperty then
-					local ok, value = pcall(gethiddenproperty, instance, "AssetId")
-					if ok then
-						assetId = value
-					end
-				end
-				if (assetId == nil or assetId == "") and gethiddenproperty_fallback then
-					local ok, value = pcall(gethiddenproperty_fallback, instance, "AssetId")
-					if ok then
-						assetId = value
-					end
-				end
-				if type(assetId) == "string" and assetId ~= "" then
-					return Content.fromUri(assetId)
-				end
-				return Content.none
-			end,
 			InitialSize = "MeshSize",
 		},
 		Part = { shape = "Shape", shap = "Shape" },
@@ -3956,6 +3935,31 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					return PropertyOverride
 				end
 			end
+		end
+
+		-- CSG requires the actual serialized geometry. An empty read must not
+		-- prevent trying the other available protected-property reader.
+		if (
+			propertyName == "ChildData" or propertyName == "ChildData2"
+			or propertyName == "MeshData" or propertyName == "MeshData2"
+			or propertyName == "PhysicsData"
+		) and instance:IsA("PartOperation") then
+			local function tryReader(reader)
+				if reader then
+					local ok, value = pcall(reader, instance, propertyName)
+					if ok and typeof(value) == "buffer" then
+						value = buffer.tostring(value)
+					end
+					if ok and type(value) == "string" and value ~= ""
+						and value ~= "can't get value"
+						and string.sub(value, 1, 23) ~= "Unable to get property " then
+						return value
+					end
+				end
+			end
+			return tryReader(gethiddenproperty)
+				or tryReader(gethiddenproperty_fallback)
+				or __BREAK
 		end
 
 		local CanRead = property.CanRead
