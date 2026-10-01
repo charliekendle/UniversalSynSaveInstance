@@ -8,13 +8,22 @@
 
 ```lua
 local Params = {
- RepoURL = "https://raw.githubusercontent.com/luau/UniversalSynSaveInstance/main/",
+ RepoURL = "https://raw.githubusercontent.com/charliekendle/UniversalSynSaveInstance/main/",
  SSI = "saveinstance",
 }
 local synsaveinstance = loadstring(game:HttpGet(Params.RepoURL .. Params.SSI .. ".luau", true), Params.SSI)()
 local Options = {} -- Documentation here https://luau.github.io/UniversalSynSaveInstance/api/SynSaveInstance
 synsaveinstance(Options)
 ```
+
+## Union operations
+
+Keep `TreatUnionsAsParts = false` (the default) to write `UnionOperation` instances
+as unions. Setting it to `true` deliberately replaces their geometry with a Part.
+This fork also tries the executor's `gethiddenproperty` for a union's published
+`AssetId` when writing its `Content`, before trying the optional
+`UGCValidationService` fallback. If neither the asset ID nor the union's raw CSG
+data is available to the client, a client-side save cannot reproduce its shape.
 
 # Universal Syn Save Instance
 

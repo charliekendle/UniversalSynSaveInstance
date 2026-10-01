@@ -2812,7 +2812,25 @@ do
 		},
 		PartOperation = {
 			Content = function(instance)
-				return Content.fromUri(gethiddenproperty_fallback(instance, "AssetId"))
+				-- Published CSG has an AssetId. The UGC fallback is normally disabled,
+				-- so try the executor's hidden-property reader first.
+				local assetId
+				if gethiddenproperty then
+					local ok, value = pcall(gethiddenproperty, instance, "AssetId")
+					if ok then
+						assetId = value
+					end
+				end
+				if (assetId == nil or assetId == "") and gethiddenproperty_fallback then
+					local ok, value = pcall(gethiddenproperty_fallback, instance, "AssetId")
+					if ok then
+						assetId = value
+					end
+				end
+				if type(assetId) == "string" and assetId ~= "" then
+					return Content.fromUri(assetId)
+				end
+				return Content.none
 			end,
 			InitialSize = "MeshSize",
 		},
