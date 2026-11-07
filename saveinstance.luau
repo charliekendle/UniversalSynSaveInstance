@@ -3663,6 +3663,7 @@ end
 --- @field SourceCache {[Instance]: string} | false -- Source text to use for these scripts as-is instead of decompiling them. ___Default:___ false
 --- @field DecompileJobless boolean -- Only use scripts that are already in the decompile cache. Missing scripts get a short not-found message. This turns on `scriptcache`. ___Default:___ false
 --- @field scriptcache boolean -- If the executor supports `getscriptbytecode`, cache decompiled code. This avoids decompiling the same script twice. The cache stays after the script reloads. ___Default:___ true
+--- @field IncrementalSave boolean -- Keep the whole hierarchy, but only save scripts that are new or changed since the previous `IncrementalSave` of the same place and `mode`. Unchanged scripts are left out and never decompiled; an unchanged script that holds a changed one is kept as an empty `Folder` named `[ClassName] Name`. Scripts are compared by a fingerprint of their bytecode, stored in `ussi_cache/incremental/`. The first run has no baseline, so it saves every script. Delete the manifest file to start over. Needs `readfile`, `writefile` and `getscriptbytecode` (or `getscripthash`); without them a normal save is made. ___Default:___ false
 --- @field RecoverScriptsFromAssets boolean -- Recover the original `Source` of scripts that were published as assets. Changes made after publishing are not included. ___Default:___ true
 --- @field IsolatePlayers boolean -- Put every [Player] under a top-level `"Players"` Folder instead of inside the [Players] service. This turns on `SaveNotCreatable`. If both are on, this option is used instead of `IsolateLocalPlayer`. ___Default:___ false
 --- @field IsolateLocalPlayer boolean -- Save the LocalPlayer as a Folder named `"LocalPlayer"` instead of a [Player] object. This is ignored if `IsolatePlayers` is on. ___Default:___ false
@@ -3823,6 +3824,7 @@ local function synsaveinstance(...)
 		RecoverScriptsFromAssets = true,
 		-- decomptype = "",
 		scriptcache = true,
+		IncrementalSave = false,
 		SaveBytecode = false,
 		BytecodeTimeout = 3,
 		SourceCache = false,
@@ -4306,6 +4308,7 @@ local function synsaveinstance(...)
 	local SharedBinaryStrings = OPTIONS.SharedBinaryStrings
 
 	local ToSaveList, ldecompile, placename, elapse_t, SaveNotCreatableWillBeEnabled, RecoveredScripts
+	local IncrementalScope -- * mode + Object path; one IncrementalSave baseline per scope
 
 	if OPTIONS.ReadMe then
 		RecoveredScripts = {}
@@ -4576,6 +4579,8 @@ local function synsaveinstance(...)
 		if Object then
 			table.insert(ToSaveList, 1, Object)
 		end
+
+		IncrementalScope = mode .. (Object and (" " .. Object:GetFullName()) or "")
 	end
 
 	local IsolateLocalPlayer = OPTIONS.IsolateLocalPlayer
@@ -4764,6 +4769,10 @@ local function synsaveinstance(...)
 		getbytecode = makeTimeoutHandler(OPTIONS.BytecodeTimeout, getscriptbytecode) -- ? Solara fix
 	end
 
+	-- * IncrementalSave reads every script's bytecode up front to fingerprint it;
+	-- * scripts it keeps reuse that read here instead of calling getbytecode again.
+	local prefetchedBytecode = {}
+
 	local SaveBytecode
 	if OPTIONS.SaveBytecode and getscriptbytecode then
 		SaveBytecode = function(script)
@@ -4787,7 +4796,13 @@ local function synsaveinstance(...)
 			local bytecode
 			if ScriptCache then
 				local s
-				s, bytecode = getbytecode(script)
+				local prefetched = prefetchedBytecode[script]
+				if prefetched ~= nil then
+					prefetchedBytecode[script] = nil
+					s, bytecode = true, prefetched
+				else
+					s, bytecode = getbytecode(script)
+				end
 				local cached
 
 				if s then
@@ -5292,6 +5307,10 @@ local function synsaveinstance(...)
 	--   tag       -- written as the class name (XML). May be an unknown class.
 	--   class     -- the resolved, instantiable class (binary INST). Never unknown.
 	--   propClass -- whose property list to read (union rewrite points elsewhere)
+	-- * IncrementalSave plan for the collect that feeds the emitter; nil otherwise.
+	-- * excluded[script] = true: unchanged script, dropped with its subtree;
+	-- * containers[script] = true: unchanged, but holds a kept script -> saved as an empty Folder.
+	local Incremental
 	local function collect(roots)
 		local ctx = {
 			entries = {},
@@ -5360,8 +5379,14 @@ local function synsaveinstance(...)
 				end
 
 				local fix = NotCreatableFixes[class]
+				local unchangedScript = Incremental and Incremental.excluded[instance]
+				if unchangedScript and not Incremental.containers[instance] then
+					return -- * IncrementalSave: unchanged script with nothing kept under it
+				end
 
-				if fix then
+				if unchangedScript then -- * kept only as the parent of a new/changed script; no Source
+					class, override, propClass = "Folder", replaceClassName(instance, name, class), "Instance"
+				elseif fix then
 					if not SaveNotCreatable then
 						return -- They won't show up in Studio anyway (Enable SaveNotCreatable if you wish to bypass this)
 					end
@@ -5447,6 +5472,322 @@ local function synsaveinstance(...)
 		ctx.roots = roots_kept
 
 		return ctx
+	end
+
+	-- * IncrementalSave: compare every collected script against the manifest of the
+	-- * previous IncrementalSave and keep only new/changed ones. The manifest maps a
+	-- * script's hierarchy path to a fingerprint of its bytecode; no source is stored.
+	local IncrementalSave = OPTIONS.IncrementalSave and true or false
+	local planIncremental, formatIncrementalReport, commitIncremental
+	do
+		local INCREMENTAL_FOLDER = USSI_FOLDER .. "incremental/"
+		local INCREMENTAL_VERSION = 1
+		local getscripthash = getscripthash
+		local INCREMENTAL_METHOD = getbytecode and "bytecode-mm3fnv32x2" or "getscripthash"
+
+		if IncrementalSave then
+			local missing
+			if not (readfile and writefile) then
+				missing = "readfile/writefile (needed to keep the baseline manifest)"
+			elseif not (getbytecode or getscripthash) then
+				missing = "getscriptbytecode or getscripthash (needed to fingerprint scripts)"
+			end
+			if missing then
+				warn("[IncrementalSave] Disabled, your executor lacks " .. missing .. ". Doing a normal full save.")
+				IncrementalSave = false
+			end
+		end
+
+		local function mul32(a, lo, hi) -- * (a * (hi * 2^16 + lo)) mod 2^32, exact in doubles
+			return (a * lo + (a * hi % 0x10000) * 0x10000) % 0x100000000
+		end
+
+		local function fmix32(h)
+			h = bit32.bxor(h, bit32.rshift(h, 16))
+			h = mul32(h, 0xca6b, 0x85eb)
+			h = bit32.bxor(h, bit32.rshift(h, 13))
+			h = mul32(h, 0xae35, 0xc2b2)
+			return bit32.bxor(h, bit32.rshift(h, 16))
+		end
+
+		-- * Deterministic 64-bit fingerprint (MurmurHash3 lane + FNV-1a lane) + length.
+		-- * Pure Luau so it never depends on which hash functions the executor has.
+		local function hashBytecode(bytecode)
+			local len = #bytecode
+			local b = buffer.fromstring(bytecode)
+			local h1, h2 = 0x9747b28c, 0x811c9dc5
+			local words = len // 4
+			for i = 0, words - 1 do
+				local w = buffer.readu32(b, i * 4)
+				local k = mul32(w, 0x2d51, 0xcc9e)
+				k = mul32(bit32.lrotate(k, 15), 0x3593, 0x1b87)
+				h1 = (bit32.lrotate(bit32.bxor(h1, k), 13) * 5 + 0xe6546b64) % 0x100000000
+				h2 = mul32(bit32.bxor(h2, w), 0x0193, 0x0100)
+			end
+			for i = words * 4, len - 1 do
+				local byte = buffer.readu8(b, i)
+				h1 = mul32(bit32.bxor(h1, byte), 0x0193, 0x0100)
+				h2 = mul32(bit32.bxor(h2, byte), 0x0193, 0x0100)
+			end
+			local lenMix = len % 0x100000000
+			return string.format("%08x%08x:%x", fmix32(bit32.bxor(h1, lenMix)), fmix32(bit32.bxor(h2, lenMix)), len)
+		end
+
+		-- * Returns fingerprint, bytecode. Fingerprint is "empty" when there is no
+		-- * bytecode (e.g. server Scripts on the client) and false when it can't be read.
+		local function fingerprintOf(script)
+			if getbytecode then
+				local ok, bytecode = getbytecode(script)
+				if not ok then
+					return false
+				end
+				if type(bytecode) ~= "string" or bytecode == "" then
+					return "empty", ""
+				end
+				return hashBytecode(bytecode), bytecode
+			end
+			local ok, hash = pcall(getscripthash, script)
+			if not ok then
+				return false
+			end
+			if hash == nil or hash == "" then
+				return "empty"
+			end
+			return tostring(hash)
+		end
+
+		local segmentCache = {}
+		local function escapeSegment(str)
+			return (string.gsub(str, "[%%/|#~]", function(c)
+				return string.format("%%%02X", string.byte(c))
+			end))
+		end
+
+		-- * "Name|ClassName", plus "#n" for the n-th sibling sharing both (n > 1).
+		local function segmentOf(instance)
+			local segment = segmentCache[instance]
+			if segment then
+				return segment
+			end
+			local parent = instance.Parent
+			local seen = {}
+			for _, sibling in parent and parent:GetChildren() or { instance } do
+				local key = sibling.ClassName .. "|" .. sibling.Name
+				local n = (seen[key] or 0) + 1
+				seen[key] = n
+				segmentCache[sibling] = escapeSegment(sibling.Name)
+					.. "|"
+					.. sibling.ClassName
+					.. (n > 1 and ("#" .. n) or "")
+			end
+			return segmentCache[instance] or (escapeSegment(instance.Name) .. "|" .. instance.ClassName)
+		end
+
+		local function pathOf(instance)
+			local parts = {}
+			local walk = instance
+			while walk and walk ~= game do
+				table.insert(parts, 1, segmentOf(walk))
+				walk = walk.Parent
+			end
+			if not walk then
+				table.insert(parts, 1, "<nil>")
+			end
+			return table.concat(parts, "/")
+		end
+
+		local function manifestFile()
+			return INCREMENTAL_FOLDER .. sanitizeFileName(game.PlaceId .. " " .. (IncrementalScope or "")) .. ".json"
+		end
+
+		function planIncremental(roots)
+			local file = manifestFile()
+			local old, baseline = {}, nil
+			local readOk, decoded = pcall(function()
+				return service.HttpService:JSONDecode(readfile(file))
+			end)
+			if readOk and type(decoded) == "table" then
+				if
+					decoded.version == INCREMENTAL_VERSION
+					and decoded.method == INCREMENTAL_METHOD
+					and type(decoded.scripts) == "table"
+				then
+					old, baseline = decoded.scripts, decoded
+				else
+					warn(
+						"[IncrementalSave] " .. file .. " was made with another version or fingerprint method; every script counts as new this time"
+					)
+				end
+			end
+
+			-- Dry-run collect: same IgnoreList/Archivable/NotCreatable filtering as the real save
+			local dry = collect(roots)
+
+			local current, occupied = {}, {}
+			for _, instance in dry.ordered do
+				local e = dry.entries[instance]
+				if not e.virtual and not e.propsOnly and typeof(instance) == "Instance" and isLuaSourceContainer(instance) then
+					yieldIfDue()
+					local path = pathOf(instance)
+					if occupied[path] then -- e.g. same-named nil instances; ClassName never contains "~"
+						local n = 2
+						while occupied[path .. "~" .. n] do
+							n += 1
+						end
+						path ..= "~" .. n
+					end
+					occupied[path] = true
+					local fp, bytecode = run_with_loading("Fingerprinting " .. instance.Name, true, nil, fingerprintOf, instance)
+					current[#current + 1] = { instance = instance, path = path, fp = fp, bytecode = bytecode }
+				end
+			end
+
+			-- 1. Same path, same fingerprint -> unchanged
+			local consumed, remaining = {}, {}
+			for _, c in current do
+				if c.fp and old[c.path] == c.fp then
+					c.status = "unchanged"
+					consumed[c.path] = true
+				else
+					remaining[#remaining + 1] = c
+				end
+			end
+
+			-- 2. Same fingerprint as a script whose old path no longer exists -> moved/renamed
+			local vacantByFp = {}
+			for path, fp in old do
+				if not occupied[path] and fp ~= "empty" then
+					local list = vacantByFp[fp]
+					if not list then
+						list = {}
+						vacantByFp[fp] = list
+					end
+					list[#list + 1] = path
+				end
+			end
+			for _, list in vacantByFp do
+				table.sort(list)
+			end
+
+			-- 3. Everything else -> modified (path known) / new / unreadable
+			for _, c in remaining do
+				local list = c.fp and c.fp ~= "empty" and vacantByFp[c.fp]
+				local from
+				if list then
+					for _, path in list do
+						if not consumed[path] then
+							from = path
+							break
+						end
+					end
+				end
+				if from then
+					consumed[from] = true
+					c.status, c.from = "moved", from
+				elseif not c.fp then
+					c.status = "unreadable"
+				elseif old[c.path] ~= nil then
+					c.status = "modified"
+				else
+					c.status = "new"
+				end
+			end
+
+			local excluded, containers, kept = {}, {}, {}
+			local report = { new = {}, modified = {}, unreadable = {}, moved = {}, deleted = {}, unchanged = 0 }
+			local scripts = {}
+			for _, c in current do
+				local status = c.status
+				if status == "unchanged" or status == "moved" then
+					excluded[c.instance] = true
+					if status == "moved" then
+						table.insert(report.moved, c.from .. " -> " .. c.instance:GetFullName())
+					else
+						report.unchanged += 1
+					end
+				else
+					kept[#kept + 1] = c
+					table.insert(report[status], c.instance:GetFullName())
+					if ScriptCache and c.bytecode then
+						prefetchedBytecode[c.instance] = c.bytecode
+					end
+				end
+				c.bytecode = nil
+				scripts[c.path] = c.fp or old[c.path] -- * unreadable: keep the last known fingerprint
+			end
+			for path in old do
+				if not occupied[path] and not consumed[path] then
+					table.insert(report.deleted, path)
+				end
+			end
+
+			-- An unchanged script holding a kept one stays, as a Folder, so the path survives
+			for _, c in kept do
+				local parent = dry.entries[c.instance].parent
+				while parent do
+					if excluded[parent] then
+						if containers[parent] then
+							break -- its ancestors were already marked
+						end
+						containers[parent] = true
+					end
+					local parentEntry = dry.entries[parent]
+					parent = parentEntry and parentEntry.parent
+				end
+			end
+
+			report.baseline = baseline and baseline.savedAt
+			return {
+				excluded = excluded,
+				containers = containers,
+				report = report,
+				file = file,
+				manifest = {
+					version = INCREMENTAL_VERSION,
+					method = INCREMENTAL_METHOD,
+					placeId = game.PlaceId,
+					scope = IncrementalScope,
+					savedAt = DateTime.now():ToIsoDate(),
+					scripts = scripts,
+				},
+			}
+		end
+
+		function formatIncrementalReport(report)
+			local LIST_LIMIT = 200
+			local lines = {
+				report.baseline and ("IncrementalSave: compared with the save from " .. report.baseline .. " (UTC)")
+					or "IncrementalSave: no baseline found, so every script counts as new",
+				string.format(
+					"Saved: %d new, %d modified, %d unreadable. Left out: %d unchanged, %d moved/renamed. Deleted since baseline: %d",
+					#report.new,
+					#report.modified,
+					#report.unreadable,
+					report.unchanged,
+					#report.moved,
+					#report.deleted
+				),
+			}
+			for _, group in { "new", "modified", "unreadable", "moved", "deleted" } do
+				local items = report[group]
+				if #items > 0 then
+					local shown = table.move(items, 1, math.min(#items, LIST_LIMIT), 1, {})
+					local suffix = #items > LIST_LIMIT and ("\n\t... and " .. (#items - LIST_LIMIT) .. " more") or ""
+					table.insert(lines, group .. ":\n\t" .. table.concat(shown, "\n\t") .. suffix)
+				end
+			end
+			return table.concat(lines, "\n")
+		end
+
+		function commitIncremental(plan)
+			pcall(function()
+				makefolder(INCREMENTAL_FOLDER)
+			end)
+			local ok, err = pcall(writefile, plan.file, service.HttpService:JSONEncode(plan.manifest))
+			if not ok then
+				warn("[IncrementalSave] Couldn't write the baseline manifest " .. plan.file .. ":", err)
+			end
+		end
 	end
 
 	local pendingExtras = {}
@@ -6106,6 +6447,7 @@ local function synsaveinstance(...)
 		end
 
 		local readmeExtra
+		local incrementalNote = "" -- * filled after planning; README source is built lazily at emit time
 		if OPTIONS.ReadMe then
 			local binaryNote = ""
 			if not OPTIONS.Binary then
@@ -6237,6 +6579,7 @@ local function synsaveinstance(...)
 				return table.concat({
 					"--[[\n",
 					"\t\tThank you for using UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n",
+					incrementalNote ~= "" and ("\t\t" .. string.gsub(incrementalNote, "\n", "\n\t\t") .. "\n\n") or "",
 					recoveredNote,
 					ghpFailureHeader,
 					writerFailureHeader,
@@ -6255,6 +6598,14 @@ local function synsaveinstance(...)
 			for _, root in extra.roots do
 				allRoots[#allRoots + 1] = root
 			end
+		end
+
+		local incrementalPlan
+		if IncrementalSave then
+			incrementalPlan = planIncremental(allRoots)
+			Incremental = incrementalPlan -- * the collect below drops unchanged scripts
+			incrementalNote = formatIncrementalReport(incrementalPlan.report)
+			print(incrementalNote)
 		end
 
 		local ctx = collect(allRoots)
@@ -6388,6 +6739,10 @@ local function synsaveinstance(...)
 				placename,
 				table.concat(chunks)
 			)
+		end
+
+		if incrementalPlan then -- * only after the output was written: a failed save keeps the old baseline
+			commitIncremental(incrementalPlan)
 		end
 	end
 
